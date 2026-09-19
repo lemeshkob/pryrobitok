@@ -29,8 +29,9 @@ BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"  # or set via env var, see run.py
 DB_PATH = Path(__file__).parent / "data" / "pryrobitok.db"
 
 # The word "приробіток" in all its case forms, tolerating common typos:
-# "приробток" (dropped і), "пріробіток" / "приробиток" (і/и mixed up), latin "i" for "і".
-PRYROBITOK_WORD = r"пр[иіi]роб[іiи]?т(?:ок|к(?:у|а|и|ом|[іi]в|ах|ами))"
+# "приробток" (dropped і), "пріробіток" / "приробиток" (і/и mixed up), latin "i" for "і",
+# "при робіток" (split prefix — "робіток" is not a word on its own, so this is safe).
+PRYROBITOK_WORD = r"пр[иіi]\s?роб[іiи]?т(?:ок|к(?:у|а|и|ом|[іi]в|ах|ами))"
 SIGN = r"(?P<sign>плюс|мінус|plus|minus|[+\-−–—])"  # incl. unicode dashes
 NEGATIVE_SIGNS = ("мінус", "minus", "-", "−", "–", "—")
 
