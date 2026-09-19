@@ -5,6 +5,7 @@ from pathlib import Path
 
 from telegram import Update
 from telegram.constants import ChatType
+from telegram.error import TelegramError
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -50,7 +51,14 @@ WANT_RE = re.compile(
     r"приробіт(?:ок|к(?:у|а|и|ом|ів|ах|ами))(?!\w)",
     re.IGNORECASE,
 )
-WANT_GIF_PATH = Path(__file__).parent / "gifs" / "want.gif"
+GIFS_DIR = Path(__file__).parent / "gifs"
+WANT_GIF_PATH = GIFS_DIR / "want.gif"
+DMG_GIF_PATH = GIFS_DIR / "dmg.gif"
+
+IMPOSTOR_TEXT = "Ти чьо пьос, возомніл себе начальніком!? Мінус приробіток"
+
+# A single penalty of this size or harsher (delta <= threshold) gets the "YOU DIED" gif.
+DMG_THRESHOLD = -10
 
 
 # ---------------------------------------------------------------------------
@@ -326,22 +334,27 @@ async def register_participants(update: Update, context: ContextTypes.DEFAULT_TY
 # Main message handler — watches for boss's pryrobitok replies
 # ---------------------------------------------------------------------------
 
-async def send_want_gif(message, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def reply_gif(
+    message, context: ContextTypes.DEFAULT_TYPE, path: Path, caption: str | None = None
+) -> bool:
+    """Replies with a gif. Returns False if the file is missing, so the caller can fall back to text."""
     # After the first upload reuse Telegram's file_id instead of re-sending the file.
-    file_id = context.bot_data.get("want_gif_file_id")
+    cache = context.bot_data.setdefault("gif_file_ids", {})
+    file_id = cache.get(path.name)
     if file_id:
-        await message.reply_animation(file_id)
-        return
+        await message.reply_animation(file_id, caption=caption)
+        return True
 
-    if not WANT_GIF_PATH.exists():
-        logger.warning("Want-gif not found at %s", WANT_GIF_PATH)
-        return
+    if not path.exists():
+        logger.warning("Gif not found at %s", path)
+        return False
 
-    with WANT_GIF_PATH.open("rb") as gif:
-        sent = await message.reply_animation(gif, filename=WANT_GIF_PATH.name)
+    with path.open("rb") as gif:
+        sent = await message.reply_animation(gif, filename=path.name, caption=caption)
     media = sent.animation or sent.document
     if media:
-        context.bot_data["want_gif_file_id"] = media.file_id
+        cache[path.name] = media.file_id
+    return True
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -360,8 +373,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     boss_id = get_boss(chat.id)
 
     if sender.id != boss_id:
-        if WANT_RE.search(message.text):
-            await send_want_gif(message, context)
+        # A batrakan playing boss (with or without a reply) gets fined instead.
+        # Only once a boss exists — before that there is nobody to impersonate.
+        if boss_id is not None and parse_delta(message.text) is not None:
+            new_score = adjust_score(chat.id, sender.id, user_display_name(sender), -1)
+            await message.reply_text(
+                f"{IMPOSTOR_TEXT}\n"
+                f"{user_display_name(sender)}: -1 приробітку → тепер {new_score}"
+            )
+        elif WANT_RE.search(message.text):
+            await reply_gif(message, context, WANT_GIF_PATH)
         return
 
     # Only the boss's replies can adjust scores.
@@ -384,9 +405,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     new_score = adjust_score(chat.id, target_user.id, user_display_name(target_user), delta)
 
     sign = "+" if delta > 0 else ""
-    await message.reply_text(
-        f"{user_display_name(target_user)}: {sign}{delta} приробітку → тепер {new_score}"
-    )
+    result_text = f"{user_display_name(target_user)}: {sign}{delta} приробітку → тепер {new_score}"
+
+    if delta <= DMG_THRESHOLD:
+        # The score is already saved — if the gif fails, still confirm it with plain text.
+        try:
+            if await reply_gif(message, context, DMG_GIF_PATH, caption=result_text):
+                return
+        except TelegramError:
+            logger.exception("Failed to send dmg gif")
+
+    await message.reply_text(result_text)
 
 
 # ---------------------------------------------------------------------------
