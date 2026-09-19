@@ -329,7 +329,7 @@ class RateLimiter:
 USER_COMMAND_LIMITER = RateLimiter(limit=3, window=20)
 CHAT_COMMAND_LIMITER = RateLimiter(limit=10, window=30)
 # Bot replies triggered by plain text from batrakany (want-gif, impostor fine).
-USER_REACTION_LIMITER = RateLimiter(limit=2, window=30)
+USER_REACTION_LIMITER = RateLimiter(limit=3, window=20)
 
 
 def rate_limited(handler):
@@ -511,6 +511,26 @@ async def reply_gif(
     return True
 
 
+async def reply_score_change(
+    message, context: ContextTypes.DEFAULT_TYPE, text: str, *, delta: int, new_score: int
+) -> None:
+    """Announces a saved score change — with the "YOU DIED" gif when it hurts enough."""
+    # Crossing counts, not just landing: -9 → -12 passes -10 and gets the gif too,
+    # while climbing back up through -10 (a plus) never does.
+    old_score = new_score - delta
+    sank_deeper = delta < 0 and debt_milestones(new_score) > debt_milestones(old_score)
+
+    if delta <= DMG_THRESHOLD or sank_deeper:
+        # The score is already saved — if the gif fails, still confirm it with plain text.
+        try:
+            if await reply_gif(message, context, DMG_GIF_PATH, caption=text):
+                return
+        except TelegramError:
+            logger.exception("Failed to send dmg gif")
+
+    await message.reply_text(text)
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
     chat = update.effective_chat
@@ -531,15 +551,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         # Only once a boss exists — before that there is nobody to impersonate.
         attempted = parse_delta(message.text) if boss_id is not None else None
         if attempted is not None:
-            # The fine always applies; only the reply is throttled, so spamming
-            # fake commands costs points without flooding the chat.
+            # Throttled attempts are ignored entirely — no fine, no reply. A fine the
+            # chat never sees just looks like the score jumping by itself.
+            if USER_REACTION_LIMITER.check((chat.id, sender.id)) != RateLimiter.ALLOW:
+                return
             new_score = adjust_score(chat.id, sender.id, user_display_name(sender), -1)
-            if USER_REACTION_LIMITER.check((chat.id, sender.id)) == RateLimiter.ALLOW:
-                pool = "impostor_plus" if attempted >= 0 else "impostor_minus"
-                await message.reply_text(
-                    f"{pick_phrase(context, chat.id, pool)} {IMPOSTOR_SUFFIX}\n"
-                    f"{user_display_name(sender)}: -1 приробітку → тепер {new_score}"
-                )
+            pool = "impostor_plus" if attempted >= 0 else "impostor_minus"
+            await reply_score_change(
+                message,
+                context,
+                f"{pick_phrase(context, chat.id, pool)} {IMPOSTOR_SUFFIX}\n"
+                f"{user_display_name(sender)}: -1 приробітку → тепер {new_score}",
+                delta=-1,
+                new_score=new_score,
+            )
         elif WANT_RE.search(message.text):
             if USER_REACTION_LIMITER.check((chat.id, sender.id)) == RateLimiter.ALLOW:
                 await reply_gif(message, context, WANT_GIF_PATH)
@@ -572,20 +597,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         result_text = f"{pick_phrase(context, chat.id, 'boss_minus')}\n{result_text}"
     # "+0 приробітків" changes nothing, so it gets no commentary
 
-    # Crossing counts, not just landing: -9 → -12 passes -10 and gets the gif too,
-    # while climbing back up through -10 (a plus) never does.
-    old_score = new_score - delta
-    sank_deeper = delta < 0 and debt_milestones(new_score) > debt_milestones(old_score)
-
-    if delta <= DMG_THRESHOLD or sank_deeper:
-        # The score is already saved — if the gif fails, still confirm it with plain text.
-        try:
-            if await reply_gif(message, context, DMG_GIF_PATH, caption=result_text):
-                return
-        except TelegramError:
-            logger.exception("Failed to send dmg gif")
-
-    await message.reply_text(result_text)
+    await reply_score_change(message, context, result_text, delta=delta, new_score=new_score)
 
 
 # ---------------------------------------------------------------------------
