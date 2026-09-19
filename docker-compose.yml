@@ -7,3 +7,5 @@ services:
       - .env
     volumes:
       - ./data:/app/data
+      # edit phrases/*.txt and `docker compose restart` — no rebuild needed
+      - ./phrases:/app/phrases:ro

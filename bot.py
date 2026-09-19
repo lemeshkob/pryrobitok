@@ -34,12 +34,15 @@ BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"  # or set via env var, see run.py
 DB_PATH = Path(__file__).parent / "data" / "pryrobitok.db"
 
 # The word "приробіток" in all its case forms, tolerating common typos:
-# "приробток" (dropped і), "пріробіток" / "приробиток" (і/и mixed up), latin "i" for "і",
-# surzhyk "прірабіток" / "пріработок" (а for о, о for і),
+# "приробток" (dropped і), "пріробіток" / "приробиток" / "прирібіток" (vowels mixed up),
+# latin "i" for "і", surzhyk "прірабіток" / "пріработок" (а for о, о for і),
 # "при робіток" (split prefix — "робіток" is not a word on its own, so this is safe).
-PRYROBITOK_WORD = r"пр[иіiы]\s?р[оа]б[іiиоы]?т(?:ок|к(?:у|а|и|ом|[іi]в|ах|ами))"
-SIGN = r"(?P<sign>плюс|мінус|plus|minus|[+\-−–—])"  # incl. unicode dashes
-NEGATIVE_SIGNS = ("мінус", "minus", "-", "−", "–", "—")
+_WORD_CYRILLIC = r"пр[иіiы]\s?р[оаиі]б[іiиоы]?т(?:ок|к(?:у|а|и|ом|[іi]в|ах|ами))"
+# Transliteration, equally forgiving: "pryrobitok", "prirobitok", "priribytok", "prirabotok".
+_WORD_LATIN = r"pr[iy]\s?r[oaiy]b[iyo]?t(?:ok|k(?:u|a|y|i|om|iv|akh|ah|amy|ami))"
+PRYROBITOK_WORD = rf"(?:{_WORD_CYRILLIC}|{_WORD_LATIN})"
+SIGN = r"(?P<sign>плюс|мінус|минус|plus|minus|[+\-−–—])"  # incl. unicode dashes
+NEGATIVE_SIGNS = ("мінус", "минус", "minus", "-", "−", "–", "—")
 
 # A signed pryrobitok command anywhere in a message. The sign is mandatory —
 # a bare "приробіток" is just a mention, not a command.
@@ -65,7 +68,8 @@ SIGN_LAST_RE = re.compile(
 # Begging for pryrobitok anywhere in a message: "хочу приробіток", "дайте приробітку",
 # "дай мені ще приробітків" (up to two words in between).
 WANT_RE = re.compile(
-    r"(?<!\w)(?:хочу|хочемо|хочеться|хочется|дай|дайте)[\s,]+(?:[\w']+[\s,]+){0,2}"
+    r"(?<!\w)(?:хочу|хочемо|хочеться|хочется|дай|дайте|k?hochu|da[ijy]|da[ijy]te)"
+    r"[\s,]+(?:[\w']+[\s,]+){0,2}"
     rf"{PRYROBITOK_WORD}(?!\w)",
     re.IGNORECASE,
 )
@@ -73,27 +77,43 @@ GIFS_DIR = Path(__file__).parent / "gifs"
 WANT_GIF_PATH = GIFS_DIR / "want.gif"
 DMG_GIF_PATH = GIFS_DIR / "dmg.gif"
 
-# Replies to a batrakan who tries to hand out pryrobitok; one is picked at random.
-IMPOSTOR_TEXTS = [
-    "Ти чьо пьос, возомніл себе начальніком!? Мінус приробіток",
-    "Куда ти лєзєш, салага? Приробітки тут роздаю я. Мінус приробіток",
-    "Їдрить твою наліво, ще один начальнік знайшовся! Мінус приробіток",
-    "Ти шо, безсмертний? Марш до станка! Мінус приробіток",
-    "Йошкін кіт, батракан командує! Рило не треснуло? Мінус приробіток",
-    "Хто тобі, хрєн моржовий, давав право голосу? Мінус приробіток",
-    "Ти диви, яке начальство вилупилось! Лопату в зуби — і в цех. Мінус приробіток",
-    "Шо за самодєятєльность, мать-перемать?! Мінус приробіток",
-    "Не по чину береш, гніда цехова. Мінус приробіток",
-    "А нє пашол би ти... план виконувати? Мінус приробіток",
-    "Губу закатай, стахановець хрєнов. Мінус приробіток",
-    "Твоє діло — пахати й не гавкати. Мінус приробіток",
-    "Ще раз побачу — підеш у нічну без обіду, падлюка. Мінус приробіток",
-    "Ти в табелі хто? Батракан! От і не рипайся, йоб твою дивізію. Мінус приробіток",
-    "Начальнік тут один, а ти — розхідний матеріал. Мінус приробіток",
-]
+# Phrase pools live in phrases/<pool>.txt — one phrase per line, blank lines and
+# "#" comments are ignored. Edit the files freely; the bot reads them on startup.
+PHRASES_DIR = Path(__file__).parent / "phrases"
+# Used only when a pool file is missing or empty, so a bad deploy can't crash the bot.
+FALLBACK_PHRASES = {
+    "impostor_plus": "Ти чьо пьос, возомніл себе начальніком!?",   # batrakan tried to give
+    "impostor_minus": "Ти чьо пьос, возомніл себе начальніком!?",  # batrakan tried to take away
+    "boss_plus": "Начальнік сьогодні добрий. Не звикай.",          # boss gave
+    "boss_minus": "Хто не працює — той їсть менше.",               # boss took away
+}
+# Appended to every impostor phrase: the fine is the punchline.
+IMPOSTOR_SUFFIX = "Мінус приробіток"
 
-# A single penalty of this size or harsher (delta <= threshold) gets the "YOU DIED" gif.
+
+def load_phrases(pool: str) -> list[str]:
+    path = PHRASES_DIR / f"{pool}.txt"
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        lines = []
+    # dict.fromkeys: drop exact duplicates but keep the file order
+    phrases = list(dict.fromkeys(
+        line.strip() for line in lines if line.strip() and not line.lstrip().startswith("#")
+    ))
+    if not phrases:
+        logger.warning("No phrases in %s — using the built-in fallback", path)
+        return [FALLBACK_PHRASES[pool]]
+    return phrases
+
+
+PHRASES = {pool: load_phrases(pool) for pool in FALLBACK_PHRASES}
+
+# The "YOU DIED" gif is sent when the boss takes pryrobitok away and either
+#   - the single penalty is this size or harsher (delta <= DMG_THRESHOLD), or
+#   - the total sinks past another DEBT_MILESTONE of debt: -10, -20, -30, ...
 DMG_THRESHOLD = -10
+DEBT_MILESTONE = 10
 
 
 # ---------------------------------------------------------------------------
@@ -226,12 +246,28 @@ def user_display_name(user) -> str:
     return user.full_name or str(user.id)
 
 
-def pick_impostor_text(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> str:
-    """Random phrase, never the same one twice in a row in a chat."""
-    last = context.bot_data.setdefault("last_impostor_text", {})
-    text = random.choice([t for t in IMPOSTOR_TEXTS if t != last.get(chat_id)])
-    last[chat_id] = text
-    return text
+def pick_phrase(context: ContextTypes.DEFAULT_TYPE, chat_id: int, pool: str) -> str:
+    """
+    Deals phrases like a shuffled deck: every phrase of the pool is used once in a chat
+    before any of them comes up again. The decks live in memory and reset on restart.
+    """
+    decks = context.bot_data.setdefault("phrase_decks", {})
+    deck = decks.get((chat_id, pool))
+    if not deck:
+        deck = random.sample(PHRASES[pool], len(PHRASES[pool]))
+        # don't open a fresh deck with the phrase that closed the previous one
+        last = context.bot_data.setdefault("last_phrase", {}).get((chat_id, pool))
+        if len(deck) > 1 and deck[-1] == last:
+            deck[0], deck[-1] = deck[-1], deck[0]
+        decks[(chat_id, pool)] = deck
+    phrase = deck.pop()
+    context.bot_data.setdefault("last_phrase", {})[(chat_id, pool)] = phrase
+    return phrase
+
+
+def debt_milestones(score: int) -> int:
+    """How many full DEBT_MILESTONEs of debt a score holds: 5 -> 0, -9 -> 0, -10 -> 1, -27 -> 2."""
+    return max(0, -score) // DEBT_MILESTONE
 
 
 def parse_delta(text: str) -> int | None:
@@ -493,13 +529,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if sender.id != boss_id:
         # A batrakan playing boss (with or without a reply) gets fined instead.
         # Only once a boss exists — before that there is nobody to impersonate.
-        if boss_id is not None and parse_delta(message.text) is not None:
+        attempted = parse_delta(message.text) if boss_id is not None else None
+        if attempted is not None:
             # The fine always applies; only the reply is throttled, so spamming
             # fake commands costs points without flooding the chat.
             new_score = adjust_score(chat.id, sender.id, user_display_name(sender), -1)
             if USER_REACTION_LIMITER.check((chat.id, sender.id)) == RateLimiter.ALLOW:
+                pool = "impostor_plus" if attempted >= 0 else "impostor_minus"
                 await message.reply_text(
-                    f"{pick_impostor_text(context, chat.id)}\n"
+                    f"{pick_phrase(context, chat.id, pool)} {IMPOSTOR_SUFFIX}\n"
                     f"{user_display_name(sender)}: -1 приробітку → тепер {new_score}"
                 )
         elif WANT_RE.search(message.text):
@@ -528,8 +566,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     sign = "+" if delta > 0 else ""
     result_text = f"{user_display_name(target_user)}: {sign}{delta} приробітку → тепер {new_score}"
+    if delta > 0:
+        result_text = f"{pick_phrase(context, chat.id, 'boss_plus')}\n{result_text}"
+    elif delta < 0:
+        result_text = f"{pick_phrase(context, chat.id, 'boss_minus')}\n{result_text}"
+    # "+0 приробітків" changes nothing, so it gets no commentary
 
-    if delta <= DMG_THRESHOLD:
+    # Crossing counts, not just landing: -9 → -12 passes -10 and gets the gif too,
+    # while climbing back up through -10 (a plus) never does.
+    old_score = new_score - delta
+    sank_deeper = delta < 0 and debt_milestones(new_score) > debt_milestones(old_score)
+
+    if delta <= DMG_THRESHOLD or sank_deeper:
         # The score is already saved — if the gif fails, still confirm it with plain text.
         try:
             if await reply_gif(message, context, DMG_GIF_PATH, caption=result_text):

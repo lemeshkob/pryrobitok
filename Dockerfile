@@ -7,6 +7,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY bot.py .
 COPY gifs/*.gif gifs/
+COPY phrases/ phrases/
 
 # SQLite DB will be stored here — mount a volume to persist it
 VOLUME ["/app/data"]
