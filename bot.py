@@ -1,6 +1,11 @@
 import logging
+import math
+import random
 import re
 import sqlite3
+import time
+from collections import defaultdict, deque
+from functools import wraps
 from pathlib import Path
 
 from telegram import (
@@ -30,8 +35,9 @@ DB_PATH = Path(__file__).parent / "data" / "pryrobitok.db"
 
 # The word "приробіток" in all its case forms, tolerating common typos:
 # "приробток" (dropped і), "пріробіток" / "приробиток" (і/и mixed up), latin "i" for "і",
+# surzhyk "прірабіток" / "пріработок" (а for о, о for і),
 # "при робіток" (split prefix — "робіток" is not a word on its own, so this is safe).
-PRYROBITOK_WORD = r"пр[иіi]\s?роб[іiи]?т(?:ок|к(?:у|а|и|ом|[іi]в|ах|ами))"
+PRYROBITOK_WORD = r"пр[иіiы]\s?р[оа]б[іiиоы]?т(?:ок|к(?:у|а|и|ом|[іi]в|ах|ами))"
 SIGN = r"(?P<sign>плюс|мінус|plus|minus|[+\-−–—])"  # incl. unicode dashes
 NEGATIVE_SIGNS = ("мінус", "minus", "-", "−", "–", "—")
 
@@ -67,7 +73,24 @@ GIFS_DIR = Path(__file__).parent / "gifs"
 WANT_GIF_PATH = GIFS_DIR / "want.gif"
 DMG_GIF_PATH = GIFS_DIR / "dmg.gif"
 
-IMPOSTOR_TEXT = "Ти чьо пьос, возомніл себе начальніком!? Мінус приробіток"
+# Replies to a batrakan who tries to hand out pryrobitok; one is picked at random.
+IMPOSTOR_TEXTS = [
+    "Ти чьо пьос, возомніл себе начальніком!? Мінус приробіток",
+    "Куда ти лєзєш, салага? Приробітки тут роздаю я. Мінус приробіток",
+    "Їдрить твою наліво, ще один начальнік знайшовся! Мінус приробіток",
+    "Ти шо, безсмертний? Марш до станка! Мінус приробіток",
+    "Йошкін кіт, батракан командує! Рило не треснуло? Мінус приробіток",
+    "Хто тобі, хрєн моржовий, давав право голосу? Мінус приробіток",
+    "Ти диви, яке начальство вилупилось! Лопату в зуби — і в цех. Мінус приробіток",
+    "Шо за самодєятєльность, мать-перемать?! Мінус приробіток",
+    "Не по чину береш, гніда цехова. Мінус приробіток",
+    "А нє пашол би ти... план виконувати? Мінус приробіток",
+    "Губу закатай, стахановець хрєнов. Мінус приробіток",
+    "Твоє діло — пахати й не гавкати. Мінус приробіток",
+    "Ще раз побачу — підеш у нічну без обіду, падлюка. Мінус приробіток",
+    "Ти в табелі хто? Батракан! От і не рипайся, йоб твою дивізію. Мінус приробіток",
+    "Начальнік тут один, а ти — розхідний матеріал. Мінус приробіток",
+]
 
 # A single penalty of this size or harsher (delta <= threshold) gets the "YOU DIED" gif.
 DMG_THRESHOLD = -10
@@ -203,6 +226,14 @@ def user_display_name(user) -> str:
     return user.full_name or str(user.id)
 
 
+def pick_impostor_text(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> str:
+    """Random phrase, never the same one twice in a row in a chat."""
+    last = context.bot_data.setdefault("last_impostor_text", {})
+    text = random.choice([t for t in IMPOSTOR_TEXTS if t != last.get(chat_id)])
+    last[chat_id] = text
+    return text
+
+
 def parse_delta(text: str) -> int | None:
     """Returns the signed delta of the first pryrobitok command found in text, else None."""
     matches = [m for m in (SIGN_FIRST_RE.search(text), SIGN_LAST_RE.search(text)) if m]
@@ -212,6 +243,93 @@ def parse_delta(text: str) -> int | None:
     match = min(matches, key=lambda m: m.start())
     amount = int(match.group("number")) if match.group("number") else 1
     return -amount if match.group("sign").lower() in NEGATIVE_SIGNS else amount
+
+
+# ---------------------------------------------------------------------------
+# Flood protection
+# ---------------------------------------------------------------------------
+
+class RateLimiter:
+    """
+    Sliding window: at most `limit` allowed events per `window` seconds per key.
+    Rejected events don't extend the window, so a spammer is let back in as soon
+    as their earlier hits expire rather than being locked out for as long as they spam.
+    """
+
+    ALLOW, WARN, DROP = "allow", "warn", "drop"
+
+    def __init__(self, limit: int, window: float) -> None:
+        self.limit = limit
+        self.window = window
+        self._hits: dict[tuple, deque[float]] = defaultdict(deque)
+        self._warned: set[tuple] = set()
+
+    def check(self, key: tuple) -> str:
+        """ALLOW — go ahead; WARN — first rejection in this burst; DROP — ignore silently."""
+        now = time.monotonic()
+        hits = self._hits[key]
+        while hits and now - hits[0] >= self.window:
+            hits.popleft()
+
+        if len(hits) < self.limit:
+            hits.append(now)
+            self._warned.discard(key)
+            return self.ALLOW
+
+        if key in self._warned:
+            return self.DROP
+        self._warned.add(key)
+        return self.WARN
+
+    def retry_after(self, key: tuple) -> int:
+        hits = self._hits.get(key)
+        if not hits:
+            return 0
+        return max(1, math.ceil(self.window - (time.monotonic() - hits[0])))
+
+
+# Commands: per user in a chat, plus a chat-wide cap so a group of people
+# (or one person with several accounts) can't flood the chat together.
+USER_COMMAND_LIMITER = RateLimiter(limit=3, window=20)
+CHAT_COMMAND_LIMITER = RateLimiter(limit=10, window=30)
+# Bot replies triggered by plain text from batrakany (want-gif, impostor fine).
+USER_REACTION_LIMITER = RateLimiter(limit=2, window=30)
+
+
+def rate_limited(handler):
+    """Wraps a command handler: over the limit a user gets one warning, then silence."""
+
+    @wraps(handler)
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        chat = update.effective_chat
+        user = update.effective_user
+        message = update.effective_message
+        if not chat or not user or not message:
+            return
+
+        user_key = (chat.id, user.id)
+        verdict = USER_COMMAND_LIMITER.check(user_key)
+        if verdict == RateLimiter.ALLOW:
+            # chat-wide cap is only charged for commands that passed the per-user check
+            verdict = CHAT_COMMAND_LIMITER.check((chat.id,))
+            if verdict == RateLimiter.ALLOW:
+                await handler(update, context)
+                return
+            if verdict == RateLimiter.WARN:
+                await message.reply_text(
+                    "Забагато команд у чаті, перекур "
+                    f"{CHAT_COMMAND_LIMITER.retry_after((chat.id,))} с. Ідіть працювати."
+                )
+            return
+
+        if verdict == RateLimiter.WARN:
+            await message.reply_text(
+                f"Не дудось, {user_display_name(user)}. "
+                f"Наступна команда — через {USER_COMMAND_LIMITER.retry_after(user_key)} с."
+            )
+        logger.info("Rate-limited command from %s in chat %s", user.id, chat.id)
+
+    return wrapper
 
 
 # ---------------------------------------------------------------------------
@@ -376,13 +494,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         # A batrakan playing boss (with or without a reply) gets fined instead.
         # Only once a boss exists — before that there is nobody to impersonate.
         if boss_id is not None and parse_delta(message.text) is not None:
+            # The fine always applies; only the reply is throttled, so spamming
+            # fake commands costs points without flooding the chat.
             new_score = adjust_score(chat.id, sender.id, user_display_name(sender), -1)
-            await message.reply_text(
-                f"{IMPOSTOR_TEXT}\n"
-                f"{user_display_name(sender)}: -1 приробітку → тепер {new_score}"
-            )
+            if USER_REACTION_LIMITER.check((chat.id, sender.id)) == RateLimiter.ALLOW:
+                await message.reply_text(
+                    f"{pick_impostor_text(context, chat.id)}\n"
+                    f"{user_display_name(sender)}: -1 приробітку → тепер {new_score}"
+                )
         elif WANT_RE.search(message.text):
-            await reply_gif(message, context, WANT_GIF_PATH)
+            if USER_REACTION_LIMITER.check((chat.id, sender.id)) == RateLimiter.ALLOW:
+                await reply_gif(message, context, WANT_GIF_PATH)
         return
 
     # Only the boss's replies can adjust scores.
@@ -459,9 +581,12 @@ def build_app(token: str) -> Application:
         ),
         group=-1,
     )
-    application.add_handler(CommandHandler("start_boss", start_boss))
-    application.add_handler(CommandHandler("pryrobitok", show_scores))
-    application.add_handler(CommandHandler("myscore", my_score))
+    # UpdateType.MESSAGE: editing an old command must not re-run it (a free way to spam).
+    commands = {"start_boss": start_boss, "pryrobitok": show_scores, "myscore": my_score}
+    for name, handler in commands.items():
+        application.add_handler(
+            CommandHandler(name, rate_limited(handler), filters=filters.UpdateType.MESSAGE)
+        )
     # UpdateType.MESSAGE excludes edited messages — otherwise editing
     # a "+приробіток" reply would count it a second time.
     application.add_handler(
