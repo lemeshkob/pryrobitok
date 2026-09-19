@@ -3,7 +3,12 @@ import re
 import sqlite3
 from pathlib import Path
 
-from telegram import Update
+from telegram import (
+    BotCommand,
+    BotCommandScopeAllGroupChats,
+    BotCommandScopeDefault,
+    Update,
+)
 from telegram.constants import ChatType
 from telegram.error import TelegramError
 from telegram.ext import (
@@ -23,32 +28,38 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"  # or set via env var, see run.py
 DB_PATH = Path(__file__).parent / "data" / "pryrobitok.db"
 
-# Regex for messages like:
-#   "приробіток" / "+приробіток" / "- приробіток"
-#   "плюс приробіток" / "мінус приробіток"
-#   "+5 приробітків" / "-3 приробітку" / "плюс 5 приробітку"
-PRYROBITOK_RE = re.compile(
-    r"""
-    ^\s*
-    (?:
-        (?P<sign_word>плюс|мінус|minus|plus)   # word form of sign
-        |
-        (?P<sign_symbol>[+\-−–—])               # symbol form of sign (incl. unicode dashes)
-    )?
-    \s*
-    (?P<number>\d+)?                            # optional explicit amount
-    \s*
-    приробіт(?:ок|к(?:у|а|и|ом|ів|ах|ами))      # word "приробіток" and forms
-    [\s.!]*$
-    """,
-    re.IGNORECASE | re.VERBOSE,
+# The word "приробіток" in all its case forms, tolerating common typos:
+# "приробток" (dropped і), "пріробіток" / "приробиток" (і/и mixed up), latin "i" for "і".
+PRYROBITOK_WORD = r"пр[иіi]роб[іiи]?т(?:ок|к(?:у|а|и|ом|[іi]в|ах|ами))"
+SIGN = r"(?P<sign>плюс|мінус|plus|minus|[+\-−–—])"  # incl. unicode dashes
+NEGATIVE_SIGNS = ("мінус", "minus", "-", "−", "–", "—")
+
+# A signed pryrobitok command anywhere in a message. The sign is mandatory —
+# a bare "приробіток" is just a mention, not a command.
+#
+# Sign before the word:
+#   "+приробіток" / "мінус приробіток" / "+5 приробітків" / "плюс 5 приробітку"
+#   "Барис барбарис - приробіток" / "молодець, +2 приробітки тобі"
+# (?<!\w) keeps hyphenated words like "супер-приробіток" from counting as a minus.
+SIGN_FIRST_RE = re.compile(
+    rf"(?<!\w){SIGN}\s*(?P<number>\d+)?\s*{PRYROBITOK_WORD}(?!\w)",
+    re.IGNORECASE,
+)
+
+# Sign after the word:
+#   "приробіток -" / "приробіток мінус" / "приробіток +5" / "приробіток мінус 3!"
+# A dash after a noun is ordinary punctuation ("приробіток — це святе"), so the sign only
+# counts when it is followed by a number or by nothing but punctuation till the end.
+SIGN_LAST_RE = re.compile(
+    rf"(?<!\w){PRYROBITOK_WORD}\s*{SIGN}\s*(?:(?P<number>\d+)(?!\w)|(?=[\s.!?,)]*$))",
+    re.IGNORECASE,
 )
 
 # Begging for pryrobitok anywhere in a message: "хочу приробіток", "дайте приробітку",
 # "дай мені ще приробітків" (up to two words in between).
 WANT_RE = re.compile(
     r"(?<!\w)(?:хочу|хочемо|хочеться|хочется|дай|дайте)[\s,]+(?:[\w']+[\s,]+){0,2}"
-    r"приробіт(?:ок|к(?:у|а|и|ом|ів|ах|ами))(?!\w)",
+    rf"{PRYROBITOK_WORD}(?!\w)",
     re.IGNORECASE,
 )
 GIFS_DIR = Path(__file__).parent / "gifs"
@@ -192,26 +203,14 @@ def user_display_name(user) -> str:
 
 
 def parse_delta(text: str) -> int | None:
-    """Returns the signed integer delta if text matches a pryrobitok command, else None."""
-    match = PRYROBITOK_RE.match(text.strip())
-    if not match:
+    """Returns the signed delta of the first pryrobitok command found in text, else None."""
+    matches = [m for m in (SIGN_FIRST_RE.search(text), SIGN_LAST_RE.search(text)) if m]
+    if not matches:
         return None
 
-    sign_word = (match.group("sign_word") or "").lower()
-    sign_symbol = match.group("sign_symbol")
-    number_str = match.group("number")
-
-    amount = int(number_str) if number_str else 1
-
-    is_negative = sign_word in ("мінус", "minus") or sign_symbol in ("-", "−", "–", "—")
-    is_positive = sign_word in ("плюс", "plus") or sign_symbol == "+"
-
-    if not is_negative and not is_positive:
-        # bare "приробіток" with no sign at all is not a valid command —
-        # require an explicit +/- or плюс/мінус to avoid false positives.
-        return None
-
-    return -amount if is_negative else amount
+    match = min(matches, key=lambda m: m.start())
+    amount = int(match.group("number")) if match.group("number") else 1
+    return -amount if match.group("sign").lower() in NEGATIVE_SIGNS else amount
 
 
 # ---------------------------------------------------------------------------
@@ -394,12 +393,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if target_user is None or target_user.is_bot:
         return
 
-    if target_user.id == boss_id:
-        await message.reply_text("Начальнік не може змінювати власний приробіток 🙂")
-        return
-
     delta = parse_delta(message.text)
     if delta is None:
+        return
+
+    if target_user.id == boss_id:
+        await message.reply_text("Начальнік не може змінювати власний приробіток 🙂")
         return
 
     new_score = adjust_score(chat.id, target_user.id, user_display_name(target_user), delta)
@@ -422,7 +421,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 # Entry point
 # ---------------------------------------------------------------------------
 
-async def check_privacy_mode(application: Application) -> None:
+BOT_COMMANDS = [
+    BotCommand("pryrobitok", "Приробіток усіх батраканів"),
+    BotCommand("myscore", "Мій приробіток"),
+    BotCommand("start_boss", "Призначити начальніка (reply або себе, один раз)"),
+]
+
+
+async def on_startup(application: Application) -> None:
+    # The menu users see when they type "/" in a group chat.
+    try:
+        await application.bot.set_my_commands(BOT_COMMANDS, scope=BotCommandScopeAllGroupChats())
+        # The bot only works in groups — don't advertise commands in private chats.
+        await application.bot.delete_my_commands(scope=BotCommandScopeDefault())
+    except TelegramError:
+        logger.exception("Failed to register the command menu")
+
     if not application.bot.bot.can_read_all_group_messages:
         logger.warning(
             "Privacy Mode is ENABLED: the bot only sees commands in groups, so "
@@ -434,7 +448,7 @@ async def check_privacy_mode(application: Application) -> None:
 def build_app(token: str) -> Application:
     init_db()
     application = (
-        Application.builder().token(token).post_init(check_privacy_mode).build()
+        Application.builder().token(token).post_init(on_startup).build()
     )
 
     # group=-1: runs first and doesn't stop the handlers below from firing
