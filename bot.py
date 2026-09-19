@@ -43,6 +43,15 @@ PRYROBITOK_RE = re.compile(
     re.IGNORECASE | re.VERBOSE,
 )
 
+# Begging for pryrobitok anywhere in a message: "хочу приробіток", "дайте приробітку",
+# "дай мені ще приробітків" (up to two words in between).
+WANT_RE = re.compile(
+    r"(?<!\w)(?:хочу|хочемо|хочеться|хочется|дай|дайте)[\s,]+(?:[\w']+[\s,]+){0,2}"
+    r"приробіт(?:ок|к(?:у|а|и|ом|ів|ах|ами))(?!\w)",
+    re.IGNORECASE,
+)
+WANT_GIF_PATH = Path(__file__).parent / "gifs" / "want.gif"
+
 
 # ---------------------------------------------------------------------------
 # Database helpers
@@ -107,6 +116,8 @@ def get_boss(chat_id: int) -> int | None:
 def ensure_batrakan(chat_id: int, user_id: int, display_name: str) -> None:
     """Registers a user with 0 score if not already tracked. Never overwrites an existing score."""
     conn = get_db()
+    # the chat row may not exist yet if nobody has run /start_boss
+    conn.execute("INSERT OR IGNORE INTO chats (chat_id, boss_user_id) VALUES (?, NULL)", (chat_id,))
     conn.execute(
         """
         INSERT INTO batrakany (chat_id, user_id, display_name, score)
@@ -286,8 +297,52 @@ async def my_score(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Roster — register everyone the bot sees in a group chat
+# ---------------------------------------------------------------------------
+
+async def register_participants(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Runs before all other handlers on every group message (text, media, commands,
+    join service messages). Telegram gives bots no way to list chat members, so the
+    roster is built from everyone who shows up in any update.
+    """
+    message = update.effective_message
+    chat = update.effective_chat
+    if not message or not chat:
+        return
+
+    seen = [message.from_user, *(message.new_chat_members or [])]
+    if message.reply_to_message:
+        seen.append(message.reply_to_message.from_user)
+
+    boss_id = get_boss(chat.id)
+    for user in seen:
+        if user is None or user.is_bot or user.id == boss_id:
+            continue
+        ensure_batrakan(chat.id, user.id, user_display_name(user))
+
+
+# ---------------------------------------------------------------------------
 # Main message handler — watches for boss's pryrobitok replies
 # ---------------------------------------------------------------------------
+
+async def send_want_gif(message, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # After the first upload reuse Telegram's file_id instead of re-sending the file.
+    file_id = context.bot_data.get("want_gif_file_id")
+    if file_id:
+        await message.reply_animation(file_id)
+        return
+
+    if not WANT_GIF_PATH.exists():
+        logger.warning("Want-gif not found at %s", WANT_GIF_PATH)
+        return
+
+    with WANT_GIF_PATH.open("rb") as gif:
+        sent = await message.reply_animation(gif, filename=WANT_GIF_PATH.name)
+    media = sent.animation or sent.document
+    if media:
+        context.bot_data["want_gif_file_id"] = media.file_id
+
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
@@ -302,15 +357,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         chat.id, sender.id, bool(message.reply_to_message),
     )
 
-    # Auto-register every non-boss participant who talks as a batrakan with 0,
-    # so the roster fills in naturally without needing a separate command.
     boss_id = get_boss(chat.id)
-    if boss_id is not None and sender.id != boss_id:
-        ensure_batrakan(chat.id, sender.id, user_display_name(sender))
+
+    if sender.id != boss_id:
+        if WANT_RE.search(message.text):
+            await send_want_gif(message, context)
+        return
 
     # Only the boss's replies can adjust scores.
-    if boss_id is None or sender.id != boss_id:
-        return
 
     if not message.reply_to_message:
         return
@@ -354,6 +408,13 @@ def build_app(token: str) -> Application:
         Application.builder().token(token).post_init(check_privacy_mode).build()
     )
 
+    # group=-1: runs first and doesn't stop the handlers below from firing
+    application.add_handler(
+        MessageHandler(
+            filters.ChatType.GROUPS & filters.UpdateType.MESSAGE, register_participants
+        ),
+        group=-1,
+    )
     application.add_handler(CommandHandler("start_boss", start_boss))
     application.add_handler(CommandHandler("pryrobitok", show_scores))
     application.add_handler(CommandHandler("myscore", my_score))
